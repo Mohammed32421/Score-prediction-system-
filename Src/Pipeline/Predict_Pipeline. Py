@@ -1,1 +1,141 @@
 
+# src/pipeline/predict_pipeline.py
+import sys
+from pathlib import Path
+from typing import Union, List
+
+import pandas as pd
+import numpy as np
+
+from src.exception import CustomException
+from src.logger import logger
+from src.utils import load_object
+
+
+class PredictPipeline:
+    """Handles loading model and preprocessor, and making predictions."""
+
+    def __init__(
+        self,
+        model_path: Union[str, Path] = Path("artifacts") / "model.pkl",
+        preprocessor_path: Union[str, Path] = Path("artifacts") / "preprocessor.pkl",
+    ):
+        self.model_path = Path(model_path)
+        self.preprocessor_path = Path(preprocessor_path)
+        self.model = None
+        self.preprocessor = None
+        self._load_artifacts()
+
+    def _load_artifacts(self) -> None:
+        """Load the model and preprocessor from disk."""
+        try:
+            if not self.model_path.exists():
+                raise FileNotFoundError(f"Model file not found: {self.model_path}")
+            if not self.preprocessor_path.exists():
+                raise FileNotFoundError(f"Preprocessor file not found: {self.preprocessor_path}")
+
+            self.model = load_object(self.model_path)
+            self.preprocessor = load_object(self.preprocessor_path)
+            logger.info("Model and preprocessor loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load artifacts: {str(e)}")
+            raise CustomException(e, sys)
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:
+        """
+        Make predictions on input features.
+
+        Args:
+            features: DataFrame containing the same columns as training data
+                      (excluding target column).
+
+        Returns:
+            Array of predictions.
+
+        Raises:
+            CustomException: If transformation or prediction fails.
+        """
+        try:
+            if self.model is None or self.preprocessor is None:
+                self._load_artifacts()
+
+            # Validate input features
+            self._validate_input_data(features)
+
+            # Transform features
+            scaled_features = self.preprocessor.transform(features)
+            logger.debug(f"Transformed feature shape: {scaled_features.shape}")
+
+            # Predict
+            predictions = self.model.predict(scaled_features)
+            logger.info(f"Predictions generated for {len(predictions)} samples")
+            return predictions
+
+        except Exception as e:
+            logger.error(f"Prediction failed: {str(e)}")
+            raise CustomException(e, sys)
+
+    def _validate_input_data(self, df: pd.DataFrame) -> None:
+        """
+        Validate that input DataFrame has required columns and correct ranges.
+        """
+        required_columns = [
+            "gender", "race_ethnicity", "parental_level_of_education",
+            "lunch", "test_preparation_course", "reading_score", "writing_score"
+        ]
+        missing = [col for col in required_columns if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing columns in input data: {missing}")
+
+        # Validate score ranges
+        if "reading_score" in df.columns:
+            if not (df["reading_score"].between(0, 100).all()):
+                raise ValueError("reading_score must be between 0 and 100")
+        if "writing_score" in df.columns:
+            if not (df["writing_score"].between(0, 100).all()):
+                raise ValueError("writing_score must be between 0 and 100")
+
+
+class CustomData:
+    """Prepares input data from web form into DataFrame."""
+
+    def __init__(
+        self,
+        gender: str,
+        race_ethnicity: str,
+        parental_level_of_education: str,
+        lunch: str,
+        test_preparation_course: str,
+        reading_score: float,
+        writing_score: float,
+    ):
+        self.gender = gender
+        self.race_ethnicity = race_ethnicity
+        self.parental_level_of_education = parental_level_of_education
+        self.lunch = lunch
+        self.test_preparation_course = test_preparation_course
+        self.reading_score = reading_score
+        self.writing_score = writing_score
+
+    def get_data_as_data_frame(self) -> pd.DataFrame:
+        """Convert the custom data to a pandas DataFrame."""
+        try:
+            # Validate ranges
+            if not (0 <= self.reading_score <= 100):
+                raise ValueError("Reading score must be between 0 and 100")
+            if not (0 <= self.writing_score <= 100):
+                raise ValueError("Writing score must be between 0 and 100")
+
+            custom_data_input_dict = {
+                "gender": [self.gender],
+                "race_ethnicity": [self.race_ethnicity],
+                "parental_level_of_education": [self.parental_level_of_education],
+                "lunch": [self.lunch],
+                "test_preparation_course": [self.test_preparation_course],
+                "reading_score": [self.reading_score],
+                "writing_score": [self.writing_score],
+            }
+            return pd.DataFrame(custom_data_input_dict)
+        except Exception as e:
+            logger.error(f"Error creating DataFrame: {str(e)}")
+            raise CustomException(e, sys)
