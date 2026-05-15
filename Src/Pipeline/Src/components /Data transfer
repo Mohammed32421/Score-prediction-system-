@@ -1,1 +1,171 @@
+# src/components/data_transformation.py
+import sys
+from pathlib import Path
+from dataclasses import dataclass
 
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from src.exception import CustomException
+from src.logger import logger
+from src.utils import save_object
+
+
+@dataclass
+class DataTransformationConfig:
+    """Configuration for data transformation."""
+    preprocessor_obj_file_path: Path = Path("artifacts") / "preprocessor.pkl"
+
+
+class DataTransformation:
+    def __init__(self):
+        self.data_transformation_config = DataTransformationConfig()
+        logger.info("DataTransformation initialized")
+
+    def get_data_transformer_object(self) -> ColumnTransformer:
+        """
+        Create a column transformer that applies different preprocessing
+        to numerical and categorical columns.
+
+        Returns:
+            ColumnTransformer with numerical and categorical pipelines.
+        """
+        try:
+            numerical_columns = ["reading_score", "writing_score"]
+            categorical_columns = [
+                "gender",
+                "race_ethnicity",
+                "parental_level_of_education",
+                "lunch",
+                "test_preparation_course",
+            ]
+
+            # Numerical pipeline: impute with median, then scale
+            num_pipeline = Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                ]
+            )
+
+            # Categorical pipeline: impute with most frequent, one-hot encode (ignore unknown), then scale
+            cat_pipeline = Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("one_hot_encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                    ("scaler", StandardScaler(with_mean=False)),  # with_mean=False for sparse/scaled
+                ]
+            )
+
+            logger.info(f"Numerical columns: {numerical_columns}")
+            logger.info(f"Categorical columns: {categorical_columns}")
+
+            preprocessor = ColumnTransformer(
+                transformers=[
+                    ("num_pipeline", num_pipeline, numerical_columns),
+                    ("cat_pipeline", cat_pipeline, categorical_columns),
+                ],
+                remainder="drop",  # drop any columns not specified
+                verbose_feature_names_out=False,  # cleaner output column names
+            )
+
+            return preprocessor
+
+        except Exception as e:
+            logger.error(f"Error creating preprocessor: {str(e)}")
+            raise CustomException(e, sys)
+
+    def initiate_data_transformation(
+        self, train_path: Path, test_path: Path
+    ) -> tuple[np.ndarray, np.ndarray, Path]:
+        """
+        Load train and test data, apply preprocessing, and return transformed arrays.
+
+        Args:
+            train_path: Path to training CSV file.
+            test_path: Path to testing CSV file.
+
+        Returns:
+            Tuple containing:
+                - Training array (features + target)
+                - Testing array (features + target)
+                - Path to saved preprocessor object
+        """
+        try:
+            # Read data
+            train_df = pd.read_csv(train_path)
+            test_df = pd.read_csv(test_path)
+            logger.info(f"Loaded train data from {train_path} (shape: {train_df.shape})")
+            logger.info(f"Loaded test data from {test_path} (shape: {test_df.shape})")
+
+            target_column_name = "math_score"
+
+            # Validate target column exists
+            if target_column_name not in train_df.columns:
+                raise ValueError(f"Target column '{target_column_name}' not found in training data")
+            if target_column_name not in test_df.columns:
+                raise ValueError(f"Target column '{target_column_name}' not found in testing data")
+
+            # Separate features and target
+            input_feature_train_df = train_df.drop(columns=[target_column_name], axis=1)
+            target_feature_train_df = train_df[target_column_name]
+
+            input_feature_test_df = test_df.drop(columns=[target_column_name], axis=1)
+            target_feature_test_df = test_df[target_column_name]
+
+            # Get preprocessor
+            preprocessing_obj = self.get_data_transformer_object()
+
+            # Fit on training data, transform both
+            logger.info("Fitting preprocessor on training data")
+            input_feature_train_arr = preprocessing_obj.fit_transform(input_feature_train_df)
+            input_feature_test_arr = preprocessing_obj.transform(input_feature_test_df)
+
+            # Convert to float32 to save memory
+            input_feature_train_arr = input_feature_train_arr.astype(np.float32)
+            input_feature_test_arr = input_feature_test_arr.astype(np.float32)
+            target_feature_train_arr = target_feature_train_df.values.astype(np.float32)
+            target_feature_test_arr = target_feature_test_df.values.astype(np.float32)
+
+            # Combine features and target
+            train_arr = np.c_[input_feature_train_arr, target_feature_train_arr]
+            test_arr = np.c_[input_feature_test_arr, target_feature_test_arr]
+
+            logger.info(f"Transformed train array shape: {train_arr.shape}")
+            logger.info(f"Transformed test array shape: {test_arr.shape}")
+
+            # Save preprocessor
+            save_object(
+                file_path=self.data_transformation_config.preprocessor_obj_file_path,
+                obj=preprocessing_obj,
+            )
+
+            return (
+                train_arr,
+                test_arr,
+                self.data_transformation_config.preprocessor_obj_file_path,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in data transformation: {str(e)}")
+            raise CustomException(e, sys)
+
+
+if __name__ == "__main__":
+    # Quick test (requires data ingestion to have run)
+    from src.components.data_ingestion import DataIngestion
+
+    ingestion = DataIngestion()
+    train_path, test_path = ingestion.initiate_data_ingestion()
+
+    transformer = DataTransformation()
+    train_arr, test_arr, preprocessor_path = transformer.initiate_data_transformation(
+        train_path, test_path
+    )
+    print(f"Train array shape: {train_arr.shape}")
+    print(f"Test array shape: {test_arr.shape}")
+    print(f"Preprocessor saved at: {preprocessor_path}")
