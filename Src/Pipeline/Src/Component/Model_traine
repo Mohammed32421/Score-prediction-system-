@@ -1,1 +1,187 @@
 
+# src/components/model_trainer.py
+import sys
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, Any
+
+import numpy as np
+from catboost import CatBoostRegressor
+from sklearn.ensemble import (
+    AdaBoostRegressor,
+    GradientBoostingRegressor,
+    RandomForestRegressor,
+)
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.tree import DecisionTreeRegressor
+from xgboost import XGBRegressor
+
+from src.exception import CustomException
+from src.logger import logger
+from src.utils import save_object, evaluate_models, save_model_metadata
+
+
+@dataclass
+class ModelTrainerConfig:
+    """Configuration for model training."""
+    trained_model_file_path: Path = Path("artifacts") / "model.pkl"
+    metadata_file_path: Path = Path("artifacts") / "model_metadata.json"
+    min_r2_score: float = 0.6  # Minimum acceptable R² score
+    n_iter_random_search: int = 20  # Number of iterations for RandomizedSearchCV
+
+
+class ModelTrainer:
+    def __init__(self):
+        self.model_trainer_config = ModelTrainerConfig()
+        logger.info("ModelTrainer initialized")
+
+    def initiate_model_trainer(
+        self, train_array: np.ndarray, test_array: np.ndarray
+    ) -> float:
+        """
+        Train and evaluate multiple models, select the best one, and save it.
+
+        Args:
+            train_array: Combined training data (features + target).
+            test_array: Combined testing data (features + target).
+
+        Returns:
+            R² score of the best model on the test set.
+
+        Raises:
+            CustomException: If no model achieves the minimum R² score.
+        """
+        try:
+            logger.info("Splitting train and test arrays into features and target")
+            X_train = train_array[:, :-1]
+            y_train = train_array[:, -1]
+            X_test = test_array[:, :-1]
+            y_test = test_array[:, -1]
+
+            logger.info(f"Train shape: {X_train.shape}, Test shape: {X_test.shape}")
+
+            # Define models and their hyperparameter distributions
+            models: Dict[str, Any] = {
+                "Random Forest": RandomForestRegressor(random_state=42),
+                "Decision Tree": DecisionTreeRegressor(random_state=42),
+                "Gradient Boosting": GradientBoostingRegressor(random_state=42),
+                "Linear Regression": LinearRegression(),
+                "XGBRegressor": XGBRegressor(random_state=42, verbosity=0),
+                "CatBoosting Regressor": CatBoostRegressor(verbose=False, random_state=42),
+                "AdaBoost Regressor": AdaBoostRegressor(random_state=42),
+            }
+
+            # Hyperparameter search spaces (simplified from original, can be expanded)
+            params = {
+                "Decision Tree": {
+                    "criterion": ["squared_error", "friedman_mse", "absolute_error", "poisson"],
+                    "max_depth": [None, 10, 20, 30],
+                    "min_samples_split": [2, 5, 10],
+                },
+                "Random Forest": {
+                    "n_estimators": [8, 16, 32, 64, 128, 256],
+                    "max_depth": [None, 10, 20],
+                    "min_samples_split": [2, 5, 10],
+                },
+                "Gradient Boosting": {
+                    "learning_rate": [0.1, 0.05, 0.01, 0.001],
+                    "subsample": [0.6, 0.7, 0.8, 0.9],
+                    "n_estimators": [8, 16, 32, 64, 128],
+                    "max_depth": [3, 5, 7],
+                },
+                "Linear Regression": {},  # No hyperparameters to tune
+                "XGBRegressor": {
+                    "learning_rate": [0.1, 0.05, 0.01, 0.001],
+                    "n_estimators": [8, 16, 32, 64, 128],
+                    "max_depth": [3, 5, 7],
+                    "subsample": [0.6, 0.8, 1.0],
+                },
+                "CatBoosting Regressor": {
+                    "depth": [6, 8, 10],
+                    "learning_rate": [0.01, 0.05, 0.1],
+                    "iterations": [30, 50, 100],
+                },
+                "AdaBoost Regressor": {
+                    "learning_rate": [0.1, 0.05, 0.01, 0.001],
+                    "n_estimators": [8, 16, 32, 64, 128],
+                    "loss": ["linear", "square", "exponential"],
+                },
+            }
+
+            logger.info("Starting model evaluation and hyperparameter tuning")
+            model_report, trained_models, best_params_dict = evaluate_models(
+                X_train=X_train,
+                y_train=y_train,
+                X_test=X_test,
+                y_test=y_test,
+                models=models,
+                params=params,
+                n_iter=self.model_trainer_config.n_iter_random_search,
+            )
+
+            # Find the best model by test R² score
+            best_model_name = max(model_report, key=model_report.get)
+            best_model_score = model_report[best_model_name]
+            best_model = trained_models[best_model_name]
+            best_params = best_params_dict.get(best_model_name, {})
+
+            logger.info(f"Best model: {best_model_name} with R² score: {best_model_score:.4f}")
+
+            # Check if best model meets minimum performance threshold
+            if best_model_score < self.model_trainer_config.min_r2_score:
+                raise CustomException(
+                    Exception(
+                        f"No model meets the minimum R² score of {self.model_trainer_config.min_r2_score}. "
+                        f"Best score: {best_model_score:.4f}"
+                    ),
+                    sys,
+                )
+
+            # Save the best model
+            save_object(
+                file_path=self.model_trainer_config.trained_model_file_path,
+                obj=best_model,
+            )
+
+            # Save model metadata (for reproducibility)
+            # Compute metrics for the best model on train and test sets
+            y_train_pred = best_model.predict(X_train)
+            y_test_pred = best_model.predict(X_test)
+
+            from src.utils import evaluate_regression_model
+
+            train_metrics = evaluate_regression_model(y_train, y_train_pred)
+            test_metrics = evaluate_regression_model(y_test, y_test_pred)
+
+            save_model_metadata(
+                model_name=best_model_name,
+                best_params=best_params,
+                train_metrics=train_metrics,
+                test_metrics=test_metrics,
+                file_path=self.model_trainer_config.metadata_file_path,
+            )
+
+            logger.info(f"Model training completed. Best model R²: {best_model_score:.4f}")
+            return best_model_score
+
+        except Exception as e:
+            logger.error(f"Error in model training: {str(e)}")
+            raise CustomException(e, sys)
+
+
+if __name__ == "__main__":
+    # Quick test (requires data ingestion and transformation to have run)
+    from src.components.data_ingestion import DataIngestion
+    from src.components.data_transformation import DataTransformation
+
+    ingestion = DataIngestion()
+    train_path, test_path = ingestion.initiate_data_ingestion()
+
+    transformer = DataTransformation()
+    train_arr, test_arr, _ = transformer.initiate_data_transformation(train_path, test_path)
+
+    trainer = ModelTrainer()
+    r2 = trainer.initiate_model_trainer(train_arr, test_arr)
+    print(f"Best model R²: {r2:.4f}")
